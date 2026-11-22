@@ -4,13 +4,17 @@ Python — версия 3.7 или новее.
 
 Сеть — нужен доступ к:
 
--UDP 53 на 8.8.8.8 (DNS напрямую, мимо hosts).
--TCP 80 на redirector.googlevideo.com.
--TCP 443 на www.youtube.com и узлы кэшей.
+-UDP 53 на 8.8.8.8 (DNS напрямую, мимо hosts)
+
+-TCP 80 на redirector.googlevideo.com
+
+-TCP 443 на www.youtube.com и узлы кэшей
+
 Если zapret выключен, https://www.youtube.com не откроется — шаг 1 (имена пулов из mn=) пропустится, но шаги 2 и 3 отработают и всё равно дадут результат.
 
 Запуск:
 Двойным кликом по find_caches.bat — он сам найдёт Python (python → py → стандартные пути), запустит скрипт и оставит окно открытым.
+
 Или вручную:
 python find_caches.py
 
