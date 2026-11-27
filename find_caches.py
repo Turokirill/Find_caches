@@ -120,6 +120,38 @@ def dechunk(b):
     return out
 
 
+def probe_http80(ip, host, timeout=TIMEOUT):
+    """
+    Контроль через порт 80.
+
+    DPI обычно не трогает 80-й порт, а узел gvs на нём отвечает. Если ответил -
+    значит машина живая, а на 443 её просто режут. Это НЕ мёртвый узел, и его
+    имя можно перенаправить на живой адрес.
+    """
+    try:
+        s = socket.create_connection((ip, 80), timeout=timeout)
+    except Exception:
+        return False
+    try:
+        s.sendall(("GET / HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n"
+                   % host).encode())
+        s.settimeout(timeout)
+        buf = b""
+        while len(buf) < 4096:
+            d = s.recv(4096)
+            if not d:
+                break
+            buf += d
+    except Exception:
+        buf = b""
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+    return buf.startswith(b"HTTP/")
+
+
 def probe_node(ip, sni, timeout=TIMEOUT):
     """
     Проверяет узел по-настоящему.
@@ -662,6 +694,10 @@ def main():
             state2, detail2 = probe_node(ip, n)
             if state2 == "OK":
                 state, detail = state2, detail2
+            elif state in ("DEAD", "TCP") and probe_http80(ip, n):
+                # 443 режут, а на 80 машина отвечает -> узел ЖИВОЙ,
+                # просто его адрес закрыт для TLS. Это лечится hosts.
+                state, detail = "HTTP80", "443 закрыт, 80 отвечает"
         return pool_name, n, ip, state, detail
 
     print(SEP)
@@ -694,24 +730,35 @@ def main():
 
     suggestions = []
 
+    # живые адреса по ВСЕМ пулам сразу: узел gvs обслуживает любое имя,
+    # поэтому имя из пула без живых узлов можно направить на живой адрес
+    # из другого пула. Именно так лечатся пулы, где режут все 443.
+    global_alive = []
+    for _p, _info in rows.items():
+        for _n, _ip, _st, _d in _info:
+            if _st == "OK" and _ip and _ip not in global_alive:
+                global_alive.append(_ip)
+
     for pool_name, names in display_pools:
         info = rows.get(pool_name, [])
         alive = [x for x in info if x[2] == "OK"]
         tls_only = [x for x in info if x[2] == "TLS"]
+        http80 = [x for x in info if x[2] == "HTTP80"]
         dead = [x for x in info if x[2] in ("DEAD", "TCP")]
         nx = [x for x in info if x[2] == "NXDOMAIN"]
 
         print(" пул %s" % pool_name)
         for n, ip, state, detail in info:
             mark = {"OK": "ЖИВ ", "TLS": "TLS ", "DEAD": "МЁРТВ",
-                    "TCP": "МЁРТВ", "NXDOMAIN": "НЕТ  "}[state]
+                    "TCP": "МЁРТВ", "NXDOMAIN": "НЕТ  ",
+                    "HTTP80": "РЕЖУТ"}[state]
             print("   %-50s %-15s %s %s" % (n, ip or "-", mark, detail))
-        print("   итого: живых %d, только-TLS %d, мёртвых %d, нет в DNS %d"
-              % (len(alive), len(tls_only), len(dead), len(nx)))
+        print("   итого: живых %d, режут по 443 %d, только-TLS %d, мёртвых %d, нет в DNS %d"
+              % (len(alive), len(http80), len(tls_only), len(dead), len(nx)))
         print()
 
         # пул целиком не существует в DNS - это не наш пул
-        if nx and not alive and not dead and not tls_only:
+        if nx and not alive and not dead and not tls_only and not http80:
             print("   Такого пула нет в DNS: ни одно из восьми имён не находится.")
             print("   Обычно это рекламные потоки (имена вида sn-aigl6nzs, sn-q4fzen7r)")
             print("   или устаревший пул, который YouTube уже не использует.")
@@ -719,22 +766,46 @@ def main():
             print()
             continue
 
+        if http80:
+            print("   ВАЖНО: %d узл(ов) отвечают по 80, но 443 закрыт." % len(http80))
+            print("   Это НЕ мёртвые узлы: машина работает, режут только порт 443.")
+            print("   Такие имена надо перенаправить на живой узел, иначе браузер")
+            print("   висит по 30 секунд на каждой попытке и видео не стартует.")
+            print()
+
         if tls_only:
             print("   ВНИМАНИЕ: %d узл(ов) проходят TLS, но не отдают HTTP." % len(tls_only))
             print("   Это и есть случай 'пул жив, а видео не работает'.")
             print()
 
-        if alive and (dead or tls_only):
-            bad = dead + tls_only
+        if alive and (dead or tls_only or http80):
+            bad = dead + tls_only + http80
             for idx, (n, ip, state, detail) in enumerate(bad):
                 target = alive[idx % len(alive)][1]
                 suggestions.append((target, n))
             print("   предложено строк для hosts: %d" % len(bad))
             print()
 
-        if not alive and not nx:
-            print("   В этом пуле нет ни одного живого узла - перенаправлять некуда.")
-            print("   Нужен VPN или ждать, пока кэш оживёт.")
+        if not alive:
+            if http80 or dead:
+                # живых в этом пуле нет, но машины отвечают по 80 (или хотя бы
+                # резолвятся). Их 443 режут, поэтому имя всё равно надо увести
+                # на живой узел - иначе браузер висит по 30 секунд на попытку.
+                pool_bad = http80 + dead
+                if global_alive and pool_bad:
+                    for idx, (n, ip, state, detail) in enumerate(pool_bad):
+                        suggestions.append((global_alive[idx % len(global_alive)], n))
+                    print("   Перенаправляю на живые узлы из других пулов: %d строк."
+                          % len(pool_bad))
+                    print("   Узел gvs обслуживает любое имя, поэтому это сработает.")
+                elif not pool_bad:
+                    print("   Все имена этого пула отсутствуют в DNS - править нечего.")
+                else:
+                    print("   Живых узлов нет ни в одном пуле - перенаправлять некуда.")
+                    print("   Нужен VPN.")
+            else:
+                print("   В этом пуле нет ни одного живого узла - перенаправлять некуда.")
+                print("   Нужен VPN или ждать, пока кэш оживёт.")
             print()
 
     # --- дубли пулов: пишем в файл и их тоже
